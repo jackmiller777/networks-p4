@@ -1,0 +1,111 @@
+#!/usr/bin/env -S python3 -u
+
+import argparse, socket, time, json, select, struct, sys, math
+
+import hashlib
+
+class Receiver:
+    def __init__(self):
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(('0.0.0.0', 0))
+        self.port = self.socket.getsockname()[1]
+        self.log("Bound to port %d" % self.port)
+
+        self.remote_host = None
+        self.remote_port = None
+        
+        self.rws = 2 # RECEIVER WINDOW SIZE
+        
+        self.buffer = {} # RECEIVED PACKET BUFFER
+        self.seqnums = [] # RECEIVED PACKET SEQUENCE NUMBERS
+        self.acks_sent = [] # ACKED PACKET SEQUENCE NUMBERS
+        
+        self.finished = False # SENDER IS FINISHED SENDING
+        
+    # SEND MESSAGE
+    def send(self, message):
+        self.socket.sendto(json.dumps(message).encode('utf-8'), (self.remote_host, self.remote_port))
+
+    # LOG MESSAGE
+    def log(self, message):
+        sys.stderr.write(message + "\n")
+        sys.stderr.flush()
+
+    # LOOP RECEIVER
+    def run(self):
+        while True:
+            socks = select.select([self.socket], [], [], 0.1)[0]
+            if socks == []:
+#                self.log('TIMED OUT RECV')
+                if self.finished:
+                    self.finish()
+            for conn in socks:
+                data, addr = conn.recvfrom(65535)
+                
+                # Grab the remote host/port if we don't already have it
+                if self.remote_host is None:
+                    self.remote_host = addr[0]
+                    self.remote_port = addr[1]
+
+                    
+                # CORRUPT PACKET CHECKS, DROP ON FAILURE
+                    
+                # CHECK MANGLE: VALID JSON?
+                try:
+                    msg = json.loads(data.decode('utf-8'))
+                except:
+                    break
+                # CHECK MANGLE: CHECKSUM ACCURATE?
+                if msg['type'] == 'msg':
+                    checksum = hashlib.md5(msg['data'].encode('utf-8')).hexdigest()
+                    if msg['checksum'] != checksum:
+                        break
+                    
+                #self.log("Received data message %s" % msg)
+                
+                # IF RECEIVED A FINISH MESSAGE, END
+                if msg['type'] == 'fin':
+#                    self.log('RECEIVER FINISHED')
+                    self.finished = True
+                else:
+                    # GET CURRENT WINDOW SIZE
+                    if len(self.acks_sent) == 0:
+                        self.rws = msg['window_sz']
+#                        self.log('RECV WINDOW SIZE='+str(self.rws))
+            
+                    # IF NEW SEQNUM, ADD
+                    seqnum = msg['seqnum']
+                    if seqnum not in self.seqnums:
+
+                        self.seqnums.append(seqnum)
+                        self.acks_sent.append(seqnum)
+                        self.buffer[seqnum] = msg
+
+                    # Always send back an ack
+                    self.send({ "type": "ack", "seqnum": seqnum})
+                
+                # IF WINDOW COMPLETE, PRINT DATA
+                if msg['type'] == 'fin' or len(self.acks_sent) == self.rws:
+                    for seqnum in sorted(self.acks_sent):
+                        msg = self.buffer[seqnum]
+                        # Print out the data to stdout
+                        print(msg["data"], end='', flush=True)
+
+                    self.acks_sent = []
+                    self.buffer = {}
+                    
+                    if self.finished:
+                        self.finish()
+
+        return
+        
+    # SEND FINISH MESSAGE
+    def finish(self):
+        
+        self.send({'type': 'fin'})
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='receive data')
+    args = parser.parse_args()
+    sender = Receiver()
+    sender.run()

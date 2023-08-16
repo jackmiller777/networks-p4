@@ -1,0 +1,252 @@
+#!/usr/bin/env -S python3 -u
+
+import argparse, socket, time, json, select, struct, sys, math
+
+import hashlib
+
+DATA_SIZE = 1375
+
+class Sender:
+    def __init__(self, host, port):
+        self.host = host
+        self.remote_port = int(port)
+        self.log("Sender starting up using port %s" % self.remote_port)
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(('0.0.0.0', 0))
+        self.waiting = False
+        
+        self.sws = 4 # SENDER WINDOW SIZE
+        
+        self.laf = -1 # LAST ACKED FRAME SEQUENCE NUMBER
+        self.seqnum = 0 # CURRENT SEQUENCE NUMBER
+        self.frames_sent = [] # SEQUENCE NUMBERS OF SENT FRAMES
+        self.acked_frames = [] # SEQUENCE NUMBERS OF ACKED FRAMES
+        
+        self.buffer = {} # DATA PACKET BUFFER
+        self.all_data_read = False # ALL DATA READ
+        self.finished = False # RECEIVER HAS BEEN NOTIFIED SENDER IS DONE SENDING
+        
+        # LATENCY
+        self.first_sent_time = 0 # TIME FIRST PACKET IN WINDOW SENT
+        self.first_ack_time = 0 # TIME FIRST PACKET IN WINDOW ACKED
+        self.first_sent = True # IF TRUE READ NEW first_sent_time
+        self.first_received = True # IF TRUE READ NEW first_ack_time
+        
+        self.latency_total = 0 # TOTAL LATENCIES READ
+        self.latency_count = 0 # COUNT OF LATENCIES READ
+        
+        self.timeout = 0 # CURRENT TIMEOUT
+        self.rtt = 1 # ESTIMATED ROUND TRIP TIME
+        
+        
+        self.grow_window = True # WINDOW GROWING
+        self.shrink_window = False # WINDOW SHRINKING
+        
+        self.resent = 0 # NUM PACKETS RESENT
+        self.mangled = False # PACKET MANGLED
+        self.num_mangled = 0 
+        
+        self.last_sent_t = 0 # TIME LAST FRAME SENT
+        
+    # LOG MESSAGE
+    def log(self, message):
+        sys.stderr.write(message + "\n")
+        sys.stderr.flush()
+
+    # SEND PACKET TO RECEIVER
+    def send(self, message):
+        if message['type'] == 'msg':
+            checksum = hashlib.md5(message['data'].encode('utf-8')).hexdigest()
+            message['checksum'] = checksum
+        self.socket.sendto(json.dumps(message).encode('utf-8'), (self.host, self.remote_port))
+        
+    # RUN SEND/RECV LOOP
+    def run(self):
+        while True:
+            sockets = [self.socket, sys.stdin] if not self.waiting else [self.socket]
+
+            socks = select.select(sockets, [], [], 0.1)[0]
+            if socks == []:
+                self.timeout += 0.1
+            else:
+                self.timeout = 0
+            for conn in socks:
+                if conn == self.socket:
+                    k, addr = conn.recvfrom(65535)
+                    msg = k.decode('utf-8')
+                    
+                    # CHECK MANGLE: VALID JSON?
+                    try:
+                        msg_d = json.loads(msg)
+                    except:
+                        # DROP IF FAILURE
+                        self.mangled = True
+                        self.num_mangled += 1
+                        break
+    
+                    #self.log("Received message '%s'" % msg)
+                    
+                    if msg_d['type'] == 'fin':
+                        self.log('Closing 3700send')
+#                        self.log('RTT=' + str(self.rtt))
+#                        self.log('RSNT=' + str(self.resent))
+#                        self.log('WNSZ=' + str(self.sws))
+                        sys.exit(0)
+                        
+                    seqnum = msg_d['seqnum']
+                    
+                    # IF SEQNUM NOT ALREADY RECEIVED
+                    if seqnum not in self.acked_frames and seqnum in self.frames_sent:
+                            
+                        # CHECK IF NEED TO RESEND
+                        if self.check_resend(seqnum):
+                            self.mangled = True
+                            
+                        self.acked_frames.append(seqnum)
+                        #self.log(str(sorted(self.acked_frames)) + ' : ' + str(sorted(self.frames_sent)))
+                        
+#                        if self.check_resend(seqnum):
+#                            self.resend()
+                        
+                        self.laf = seqnum
+                            
+                        # CALCULATE LATENCY
+                        if self.first_received:
+                            self.first_ack_time = time.time()
+                            self.first_sent = True
+                            self.first_received = False
+                            
+                            latency = self.first_ack_time - self.first_sent_time
+#                            self.latency_total += latency
+#                            self.latency_count += 1
+                            
+                            self.rtt = latency
+                            
+                        # CHECK IF ALL FRAMES ACKED
+                        if sorted(self.acked_frames) == sorted(self.frames_sent):
+                            
+                            # CLEANUP TEMP VARS
+                            self.laf = max(self.acked_frames)
+                            self.waiting = False
+                            self.frames_sent = []
+                            self.acked_frames = []
+                            self.buffer = {}
+                            
+                            # GROW / SHRINK WINDOW
+#                            self.log(str(self.resent) + ' , mangled?=' + str(self.mangled) + ' ' + str(self.grow_window) + ' ' + str(self.shrink_window))
+                            if not self.mangled:
+                                if self.resent > 0:
+                                    self.grow_window = False
+                                    self.shrink_window = True
+
+                                    self.resent = 0
+
+                                # SHRINK/GROW WINDOW
+                                if self.grow_window:
+                                    self.sws += 2
+                                    #self.log('SENDER WINDOW GROWN='+str(self.sws))
+                                elif self.shrink_window and self.sws > 2:
+                                    self.sws -= 1
+                                    self.shrink_window = False
+                                    #self.log('SENDER WINDOW SHRUNK='+str(self.sws))
+                                elif self.sws == 2:
+                                    self.grow_window = True
+                        
+                            self.mangled = False
+                            
+                            # IF DONE SEND FINISHED
+                            if self.all_data_read and not self.finished:
+                                self.finish()
+        
+                    
+                elif conn == sys.stdin:
+                    # READ IN DATA
+                    data = sys.stdin.read(DATA_SIZE)
+                    if len(data) == 0:
+                        #self.log("All done!")
+                        self.waiting = True
+                        self.all_data_read = True
+                        
+                        # IF DONE SEND FINISHED
+                        if sorted(self.acked_frames) == sorted(self.frames_sent) and not self.finished:
+                            self.finish()
+                    else:
+                        # WHEN WINDOW SIZE IS REACHED, START WAITING
+                        if len(self.frames_sent) + 1 == self.sws:
+                            self.waiting = True
+                            self.last_sent_t = time.time()
+
+                        # BUILD DATA PACKET
+                        msg = { 
+                            "type": "msg", 
+                            "data": data, 
+                            "seqnum": self.seqnum,
+                            "window_sz": self.sws
+                        }
+                        
+                        # LATENCY : TRACK FIRST PACKET IN WINDOW
+                        if self.first_sent:
+                            self.first_sent_time = time.time()
+                            
+                            # STOP TRACKING PACKETS
+                            self.first_sent  = False
+                            self.first_received = True
+                        
+                        # SEND MESSAGE, STORE IN TEMPORARY BUFFER
+                        #self.log("Sending message '%s'" % msg)
+                        self.send(msg)
+                        self.frames_sent.append(self.seqnum)
+                        self.buffer[self.seqnum] = msg
+                        
+                        # INC SEQUENCE NUMBER
+                        self.seqnum += 1
+                    
+
+            if self.timeout >= self.rtt:
+#                self.log('TIMED OUT SEND')
+                self.resend()
+                self.timeout = 0
+                
+        return
+    
+    # SEND FINISH MESSAGE
+    def finish(self):
+        self.send({'type': 'fin'})
+        self.finished = True
+    
+    # CHECK IF RESEND NEEDED, AND RESEND
+    def check_resend(self, seqnum):
+        check = ((abs(seqnum - self.laf) > 1) or (len(self.acked_frames) > 0 and seqnum > max(self.acked_frames) + 1)) and ((time.time() - self.last_sent_t) > self.rtt * self.sws)
+#        self.log(str(time.time() - self.last_sent_t) + '>' + str(self.rtt * self.sws))
+#        self.log(str((time.time() - self.last_sent_t) > self.rtt * self.sws))
+        if check:
+            to_resend = set(self.acked_frames).symmetric_difference(self.frames_sent)   
+            for i in range(self.laf + 1, seqnum):
+                if i in to_resend:
+                    #self.log('SENDING '+ str(i))
+                    self.send(self.buffer[i])
+                    self.last_sent_t = time.time()
+                    #self.resent += 1
+            if self.finished:
+                self.finish()
+        return check
+    
+    # RESEND ON TIMEOUT
+    def resend(self):
+        to_resend = set(self.acked_frames).symmetric_difference(self.frames_sent)
+        for i in to_resend:
+            #self.log('SENDING '+ str(i))
+            self.send(self.buffer[i])
+            self.last_sent_t = time.time()
+            self.resent += 1
+        if self.finished:
+            self.finish()
+        
+        
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='send data')
+    parser.add_argument('host', type=str, help="Remote host to connect to")
+    parser.add_argument('port', type=int, help="UDP port number to connect to")
+    args = parser.parse_args()
+    sender = Sender(args.host, args.port)
+    sender.run()
